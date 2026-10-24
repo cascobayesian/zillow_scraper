@@ -24,3 +24,7 @@ class GoogleFormConstants:
 
 class ZillowParseError(Exception):
     """Custom exception for Zillow scraping errors."""
+
+
+class CaptchaDetectedError(Exception):
+    """Raised when Zillow serves a bot-check page instead of results."""
