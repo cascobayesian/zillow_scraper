@@ -1,11 +1,13 @@
 """Zillow scraping and parsing functionality."""
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from random import SystemRandom
 from statistics import median
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
@@ -23,6 +25,15 @@ class PropertyListing:
     price: str
     median_price: str
     link: str
+    beds: str = ""
+    baths: str = ""
+    sqft: str = ""
+    home_type: str = ""
+    days_on_zillow: str = ""
+    rent_zestimate: str = ""
+    latitude: str = ""
+    longitude: str = ""
+    zpid: str = ""
 
 
 class ZillowCardParser:
@@ -73,23 +84,25 @@ class ZillowCardParser:
         self.main_link = self._parse_main_link()
         self._validate_basics()
 
-    def _clean_price_text(self, price_text: str) -> str:
+    @classmethod
+    def _clean_price_text(cls, price_text: str) -> str:
         """Clean and standardize price text."""
         cleaned = price_text
 
         # Apply regex patterns
-        for pattern, replacement, flags in self.PRICE_CLEANUP_PATTERNS:
+        for pattern, replacement, flags in cls.PRICE_CLEANUP_PATTERNS:
             cleaned = re.sub(pattern, replacement, cleaned, flags=flags)
 
         # Apply string replacements
-        for replacement in self.PRICE_REPLACEMENTS:
+        for replacement in cls.PRICE_REPLACEMENTS:
             cleaned = re.sub(replacement, "", cleaned, flags=re.IGNORECASE)
 
         return cleaned.strip()
 
-    def _extract_numeric_price(self, price_text: str) -> int | None:
+    @classmethod
+    def _extract_numeric_price(cls, price_text: str) -> int | None:
         """Extract numeric value from price text."""
-        numeric_only = self._PATTERN_NUMERIC.sub("", price_text).replace(",", "")
+        numeric_only = cls._PATTERN_NUMERIC.sub("", price_text).replace(",", "")
         try:
             return int(float(numeric_only))
         except ValueError:
@@ -289,3 +302,92 @@ class ZillowHomeFinder:
     def links(self) -> list[str]:
         """Get all links."""
         return [listing.link for listing in self.listings]
+
+
+def _text(value: object) -> str:
+    return "" if value is None else str(value)
+
+
+class ZillowSearchJson:
+    """
+    Parse listings from the search-results JSON Zillow embeds in each results page.
+
+    Zillow's Next.js pages ship their data in <script id="__NEXT_DATA__">, under
+    props.pageProps.searchPageState.cat1. This is the same data the page renders its
+    cards from, so it needs no extra requests and doesn't depend on card markup.
+    """
+
+    BASE_URL = "https://www.zillow.com/"
+
+    def __init__(self, next_data_text: str) -> None:
+        try:
+            data = json.loads(next_data_text)
+            search = data["props"]["pageProps"]["searchPageState"]["cat1"]
+            self.results: list[dict[str, Any]] = search["searchResults"]["listResults"]
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            error_msg = f"Search JSON not in the expected format: {e}"
+            raise ZillowParseError(error_msg) from e
+
+        search_list = search.get("searchList") or {}
+        self.total_result_count: int | None = search_list.get("totalResultCount")
+        next_path = (search_list.get("pagination") or {}).get("nextUrl")
+        self.next_url: str | None = urljoin(self.BASE_URL, next_path) if next_path else None
+
+        self.listings: list[PropertyListing] = []
+        for result in self.results:
+            self.listings.extend(self._parse_result(result))
+
+    def _link(self, result: dict[str, Any]) -> str:
+        return urljoin(self.BASE_URL, _text(result.get("detailUrl")))
+
+    def _parse_result(self, result: dict[str, Any]) -> list[PropertyListing]:
+        if result.get("units"):
+            return self._parse_building(result)
+        return [self._parse_single(result)]
+
+    def _parse_single(self, result: dict[str, Any]) -> PropertyListing:
+        """Parse a single rentable home or apartment unit."""
+        home = (result.get("hdpData") or {}).get("homeInfo") or {}
+        lat_long = result.get("latLong") or {}
+        price = ZillowCardParser._clean_price_text(_text(result.get("price")))  # noqa: SLF001
+        numeric_price = result.get("unformattedPrice") or ZillowCardParser._extract_numeric_price(price)  # noqa: SLF001
+        return PropertyListing(
+            address=_text(result.get("address")),
+            price=price,
+            median_price=_text(numeric_price) if numeric_price else price,
+            link=self._link(result),
+            beds=_text(result.get("beds")),
+            baths=_text(result.get("baths")),
+            sqft=_text(result.get("area")),
+            home_type=_text(home.get("homeType")),
+            days_on_zillow=_text(home.get("daysOnZillow")),
+            rent_zestimate=_text(home.get("rentZestimate")),
+            latitude=_text(lat_long.get("latitude")),
+            longitude=_text(lat_long.get("longitude")),
+            zpid=_text(home.get("zpid") or result.get("zpid")),
+        )
+
+    def _parse_building(self, result: dict[str, Any]) -> list[PropertyListing]:
+        """Parse an apartment building into one listing per floor plan (bedroom count)."""
+        lat_long = result.get("latLong") or {}
+        link = self._link(result)
+        listings = []
+        for unit in result["units"]:
+            beds = _text(unit.get("beds"))
+            bed_label = "Studio" if beds == "0" else f"{beds} bd"
+            price = ZillowCardParser._clean_price_text(_text(unit.get("price")))  # noqa: SLF001
+            numeric_price = ZillowCardParser._extract_numeric_price(price)  # noqa: SLF001
+            listings.append(
+                PropertyListing(
+                    address=f"{_text(result.get('address'))} ({bed_label})",
+                    price=price,
+                    median_price=_text(numeric_price) if numeric_price else price,
+                    link=f"{link}#bedrooms-{beds}" if beds else link,
+                    beds=beds,
+                    home_type="APARTMENT_BUILDING",
+                    latitude=_text(lat_long.get("latitude")),
+                    longitude=_text(lat_long.get("longitude")),
+                    zpid=_text(result.get("zpid")),
+                )
+            )
+        return listings

@@ -4,12 +4,13 @@ import logging
 import tempfile
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from random import SystemRandom
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from patchright.async_api import BrowserContext, Page, async_playwright
-from tqdm import tqdm
 
 from src.constants import (
     MAX_SCROLL_DOWN,
@@ -19,23 +20,31 @@ from src.constants import (
     MIN_SCROLL_UP,
     MIN_WAIT_TIME,
     PROBABILITY_SCROLL_UP,
+    CaptchaDetectedError,
+    ZillowParseError,
 )
-from src.scraper import PropertyListing, ZillowHomeFinder
+from src.scraper import PropertyListing, ZillowHomeFinder, ZillowSearchJson
+
+if TYPE_CHECKING:
+    from src.proxies import Proxy
+    from src.throttle import RequestThrottle
 
 logger = logging.getLogger(__name__)
 cryptogen = SystemRandom()
 
 
 @asynccontextmanager
-async def create_browser_context() -> AsyncGenerator[BrowserContext, Any]:
-    """Create and configure browser with Patchright's stealth mode."""
+async def create_browser_context(proxy: "Proxy | None" = None) -> AsyncGenerator[BrowserContext, Any]:
+    """Create and configure browser with Patchright's stealth mode, optionally routed through a proxy."""
     with tempfile.TemporaryDirectory(prefix="patchright_") as temp_dir:
         async with async_playwright() as p:
+            logger.info("Launching browser via %s", proxy or "direct connection")
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=temp_dir,
                 channel="chrome",
                 headless=False,
                 no_viewport=True,
+                proxy=proxy.to_playwright() if proxy else None,  # type: ignore[arg-type]
             )
 
             try:
@@ -196,62 +205,50 @@ async def scroll_and_load_listings(page: Page, max_entries: int = 100, max_no_ch
     await simulate_human_behavior(page)
 
 
-async def check_and_click_next_page(page: Page) -> bool:
-    """
-    Check if next page button exists and is enabled, then click it.
+async def raise_if_captcha(page: Page) -> None:
+    """Raise CaptchaDetectedError if Zillow served its bot check instead of results."""
+    if await page.get_by_text("Press & Hold").count() > 0 or await page.locator("#px-captcha").count() > 0:
+        error_msg = f"CAPTCHA detected at {page.url}"
+        raise CaptchaDetectedError(error_msg)
 
-    Returns True if next page button was clicked, False otherwise.
-    """
-    try:
-        selector = "a[title='Next page']"
-        next_button = page.locator(selector).first
 
-        if not next_button:
-            logger.warning("No next page button found")
-            return False
+async def get_next_page_url(page: Page) -> str | None:
+    """Return the absolute URL of the next results page, or None on the last page."""
+    next_button = page.locator("a[title='Next page']").first
+    if await next_button.count() == 0:
+        logger.debug("No next page button found")
+        return None
 
-        # Check if button is enabled (not disabled)
-        is_disabled = await next_button.is_disabled()
-        is_visible = await next_button.is_visible()
+    if await next_button.get_attribute("aria-disabled") == "true" or await next_button.is_disabled():
+        logger.debug("Next page button is disabled")
+        return None
 
-        if is_disabled:
-            logger.debug("Next page button found but disabled: %s", selector)
-            return False
+    href = await next_button.get_attribute("href")
+    if not href:
+        logger.debug("Next page button has no href")
+        return None
 
-        if not is_visible:
-            logger.debug("Next page button found but not visible: %s", selector)
-            return False
-
-        logger.debug("Found enabled next page button with selector: %s", selector)
-        await next_button.click()
-        await page.wait_for_load_state()
-        return True
-
-    except TimeoutError as e:
-        logger.warning("Error checking for next page button: %s", e)
-        return False
+    return urljoin(page.url, href)
 
 
 async def sort_by_newest(page: Page) -> None:
-    """Sort listings by newest first."""
-    sort_button = page.locator("button[aria-label='Sort Properties']").first
-
-    if not sort_button:
-        logger.debug("Sort page styled button not found, looking for popover")
-        sort_button = page.locator("button[id='sort-popover']").first
-
-    if not sort_button:
-        logger.debug("Sort page popover button not found")
-        logger.error("No sort page button found")
+    """Sort listings by newest first. Leaves the default order if the sort controls aren't found."""
+    for selector in ("button[aria-label='Sort Properties']", "button[id='sort-popover']"):
+        sort_button = page.locator(selector).first
+        if await sort_button.count() > 0:
+            break
+        logger.debug("Sort button not found: %s", selector)
+    else:
+        logger.warning("No sort button found, keeping Zillow's default order")
         return
 
     await sort_button.click()
     await page.wait_for_load_state()
     await simulate_human_behavior(page)
 
-    newest_button = page.get_by_text("Newest")
-    if not newest_button:
-        logger.error("No sort page by newest button found")
+    newest_button = page.get_by_text("Newest").first
+    if await newest_button.count() == 0:
+        logger.warning("No sort by newest option found, keeping Zillow's default order")
         return
 
     await newest_button.click()
@@ -272,31 +269,71 @@ async def scrape_single_page(page: Page) -> list[PropertyListing]:
     return finder.listings
 
 
-async def scrape_all_pages(page: Page) -> list[PropertyListing]:
-    """Scrape all pages of listings, returning all listings found."""
-    all_listings: list[PropertyListing] = []
+async def read_search_json(page: Page) -> ZillowSearchJson | None:
+    """Parse the search-results JSON embedded in the page, or None if it's missing or malformed."""
+    next_data = await page.evaluate("() => document.getElementById('__NEXT_DATA__')?.textContent ?? null")
+    if not next_data:
+        logger.warning("No embedded search JSON on page")
+        return None
+    try:
+        return ZillowSearchJson(next_data)
+    except ZillowParseError as e:
+        logger.warning("%s", e)
+        return None
 
-    page_number = 1
-    has_next_page = True
-    with tqdm(desc="Scraping pages", bar_format="{desc}: page {n} [{elapsed}, {rate_fmt}]{postfix}") as pbar:
-        while has_next_page:
-            pbar.update(1)
-            pbar.set_postfix({"listings": len(all_listings)})
 
-            logger.debug("Scraping page %s", page_number)
+@dataclass
+class ScrapeProgress:
+    """Where a multi-proxy scrape has got to, so a new proxy can resume from the same page."""
 
+    next_url: str | None
+    listings: list[PropertyListing] = field(default_factory=list)
+    pages_scraped: int = 0
+    sorted_by_newest: bool = False
+
+
+async def load_results_page(page: Page, url: str, throttle: "RequestThrottle") -> None:
+    """Navigate to a results page after waiting for the throttle, and check for a bot block."""
+    await throttle.wait()
+    logger.info("Loading %s", url)
+    await page.goto(url)
+    await simulate_human_behavior(page)
+    await raise_if_captcha(page)
+    await close_modal_if_present(page)
+
+
+async def scrape_pages(page: Page, progress: ScrapeProgress, throttle: "RequestThrottle", max_pages: int) -> None:
+    """
+    Scrape up to max_pages result pages starting at progress.next_url, updating progress in place.
+
+    progress is updated after every page, so if this raises partway through,
+    the caller can resume from progress.next_url with a different proxy.
+    """
+    for _ in range(max_pages):
+        if progress.next_url is None:
+            return
+
+        await load_results_page(page, progress.next_url, throttle)
+
+        if not progress.sorted_by_newest:
+            await throttle.wait()
+            await sort_by_newest(page)
+            await simulate_human_behavior(page)
+            await raise_if_captcha(page)
+            progress.sorted_by_newest = True
+
+        search_json = await read_search_json(page)
+        if search_json is not None:
+            page_listings = search_json.listings
+            progress.next_url = search_json.next_url
+        else:
+            logger.info("Falling back to parsing listing cards from HTML")
             page_listings = await scrape_single_page(page)
-            all_listings.extend(page_listings)
-            logger.debug("Found %s listings on page %s", len(page_listings), page_number)
+            progress.next_url = await get_next_page_url(page)
 
-            has_next_page = await check_and_click_next_page(page)
-            if not has_next_page:
-                logger.debug("No more pages to process or next button is disabled")
-
-            page_number += 1
-
-    logger.debug("Total listings scraped: %s from %s page(s)", len(all_listings), page_number)
-    return all_listings
+        progress.listings.extend(page_listings)
+        progress.pages_scraped += 1
+        logger.info("Page %s: %s listings (%s total)", progress.pages_scraped, len(page_listings), len(progress.listings))
 
 
 # Data Processing

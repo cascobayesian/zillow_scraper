@@ -1,0 +1,9 @@
+# One proxy per line. Copy to proxies.txt (gitignored) and fill in your provider's endpoints.
+# Blank lines and lines starting with '#' are ignored. Accepted formats:
+#   http://user:pass@host:port
+#   socks5://host:port          (Chromium does not support SOCKS5 with a username/password)
+#   host:port                   (assumed http)
+#   host:port:user:pass         (assumed http)
+#
+# http://user:pass@proxy1.example.com:8000
+# http://user:pass@proxy2.example.com:8000
